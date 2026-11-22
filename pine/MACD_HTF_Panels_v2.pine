@@ -1,0 +1,518 @@
+// This Pine Script™ code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © TheUltimator5 (original "MACD with HTF Panels")
+// v2 modifications:
+//   - Panels redraw on every last-bar update (no more stale / drifting panels in realtime)
+//   - "Closed HTF bars only" mode: non-repainting (lookahead_on + skip developing bar)
+//   - MACD scale always includes zero -> histogram never spills outside its panel
+//   - Candles and MACD get separate sub-bands when candles are shown
+//   - Panel frame + zero line + MACD/Signal cross markers
+//   - Timeframe detection / labels via timeframe.in_seconds() (fixes "360" -> "1H", tick charts)
+//   - Adaptive value formatting (works on forex / low-priced symbols)
+//   - Confluence row + alertcondition() + dynamic alert() messages
+//   - Removed chart.visible_bar_time zoom scaling (forced recalculation on every scroll)
+
+//@version=6
+indicator("MACD with HTF Panels v2", shorttitle="MACD HTF v2", overlay=false, max_lines_count=500, max_labels_count=300, max_boxes_count=50)
+
+// ───────────────────────────── Groups ─────────────────────────────
+const string G_MACD  = "MACD"
+const string G_DATA  = "HTF Data"
+const string G_PANEL = "HTF Panels"
+const string G_POS   = "HTF Panels: Position & Size"
+const string G_LOOK  = "HTF Panels: Appearance"
+const string G_SCALE = "HTF Panel Scaling"
+const string G_TBL   = "Signal Table"
+const string G_ALERT = "Alerts"
+
+// ───────────────────────────── Inputs ─────────────────────────────
+macd_fast   = input.int(12, "Fast Length", minval=1, group=G_MACD)
+macd_slow   = input.int(26, "Slow Length", minval=1, group=G_MACD)
+macd_signal = input.int(9, "Signal Smoothing", minval=1, group=G_MACD)
+
+confirmed_only = input.bool(true, "Closed HTF Bars Only (Non-Repainting)", group=G_DATA,
+     tooltip="ON: panels, table and alerts use only completed HTF bars. Values never change after the fact. OFF: the still-forming HTF bar is included and its values move tick by tick.")
+
+show_panels = input.bool(true, "Enable HTF Side Panels", group=G_PANEL)
+panel_count = input.int(4, "Number of Panels", minval=1, maxval=4, group=G_PANEL,
+     tooltip="1 = HTF1 centered. 2 = HTF1 top / HTF2 bottom. 3 = HTF1/HTF2/HTF3 stacked. 4 = 2x2 grid (left: HTF1/HTF2, right: HTF3/HTF4).")
+
+panel_xoffset      = input.int(20, "Horizontal Offset (bars)", minval=1, maxval=200, group=G_POS, tooltip="Bars from the last chart bar to the left edge of the panels.")
+panel_bars         = input.int(30, "Bars per Panel", minval=5, maxval=40, group=G_POS)
+panel_col_gap      = input.int(10, "Column Gap (bars)", minval=0, maxval=100, group=G_POS, tooltip="4-panel mode only.")
+panel_height       = input.float(6.0, "Panel Height (Size Units)", minval=0.5, maxval=20.0, group=G_POS)
+panel_atr_len      = input.int(14, "Size Unit Length (Bars)", minval=1, group=G_POS, tooltip="1 unit = ATR over this many chart bars.")
+panel_center_y     = input.float(2.0, "Vertical Center (Size Units)", group=G_POS)
+panel_gap          = input.float(0.6, "Gap Between Panels (Size Units)", minval=0.0, group=G_POS)
+panel_candle_width = input.int(2, "Candle Width (bars)", minval=1, maxval=10, group=G_POS)
+
+show_panel_candles  = input.bool(false, "Show Candles in Panels", group=G_LOOK, tooltip="Candles get the top 40% of each panel, MACD the bottom 55%.")
+panel_candle_transp = input.int(60, "Candle Transparency", minval=0, maxval=100, group=G_LOOK)
+panel_bull_col      = input.color(color.lime, "Bull Candle", group=G_LOOK)
+panel_bear_col      = input.color(color.fuchsia, "Bear Candle", group=G_LOOK)
+show_frame          = input.bool(true, "Show Panel Frame", group=G_LOOK)
+panel_bg_col        = input.color(color.new(color.gray, 92), "Panel Background", group=G_LOOK)
+panel_border_col    = input.color(color.new(color.gray, 60), "Panel Border", group=G_LOOK)
+show_zero_line      = input.bool(true, "Show Zero Line", group=G_LOOK)
+show_cross_marks    = input.bool(true, "Show MACD/Signal Cross Markers", group=G_LOOK)
+show_panel_labels   = input.bool(true, "Show Panel Titles", group=G_LOOK)
+panel_label_offset  = input.int(2, "Panel Title Offset (bars)", minval=0, maxval=40, group=G_LOOK)
+
+panel_size_mode    = input.string("Auto (Fill Available Space)", "Panel Size Mode", options=["Auto (Fill Available Space)", "Manual"], group=G_SCALE)
+panel_manual_scale = input.float(1.0, "Manual Size Multiplier", minval=0.1, maxval=10.0, step=0.1, group=G_SCALE)
+
+htf1_auto      = input.bool(true, "Auto Timeframe", inline="h1", group="HTF1 (Nearest TF)")
+htf1_manual_tf = input.timeframe("D", "Manual", inline="h1", group="HTF1 (Nearest TF)")
+htf2_auto      = input.bool(true, "Auto Timeframe", inline="h2", group="HTF2 (Middle TF)")
+htf2_manual_tf = input.timeframe("W", "Manual", inline="h2", group="HTF2 (Middle TF)")
+htf3_auto      = input.bool(true, "Auto Timeframe", inline="h3", group="HTF3 (Furthest TF)")
+htf3_manual_tf = input.timeframe("M", "Manual", inline="h3", group="HTF3 (Furthest TF)")
+htf4_auto      = input.bool(true, "Auto Timeframe", inline="h4", group="HTF4 (4-Panel Mode Only)")
+htf4_manual_tf = input.timeframe("3M", "Manual", inline="h4", group="HTF4 (4-Panel Mode Only)")
+
+show_signal_table       = input.bool(true, "Show Signal Table", group=G_TBL)
+show_panel_values_table = input.bool(true, "Show HTF Value Rows", group=G_TBL)
+show_confluence_row     = input.bool(true, "Show Confluence Row", group=G_TBL, tooltip="Counts how many active HTFs have MACD above / below Signal.")
+table_position          = input.string("Bottom Right", "Table Position", options=["Top Left", "Top Right", "Bottom Left", "Bottom Right", "Middle Left", "Middle Right"], group=G_TBL)
+
+fire_alerts = input.bool(true, "Send alert() Messages Per HTF Cross", group=G_ALERT,
+     tooltip="Create an alert with condition 'Any alert() function call' to receive per-timeframe messages. Use with 'Closed HTF Bars Only' to avoid alerts on crosses that later undo.")
+
+// ───────────────────────────── Constants ─────────────────────────────
+const color MACD_LINE_COLOR   = color.yellow
+const color MACD_SIGNAL_COLOR = color.aqua
+const color HIST_POS_UP       = color.lime
+const color HIST_POS_DOWN     = color.new(color.green, 50)
+const color HIST_NEG_UP       = color.new(color.red, 50)
+const color HIST_NEG_DOWN     = color.red
+
+int SKIP      = confirmed_only ? 1 : 0       // index of the newest bar we are allowed to use
+int KEEP_BARS = panel_bars + 2               // skip slot + panel bars + one extra for prev-value colouring
+req_lookahead = confirmed_only ? barmerge.lookahead_on : barmerge.lookahead_off
+
+// ───────────────────────────── Helpers ─────────────────────────────
+get_table_position() =>
+    switch table_position
+        "Top Left"     => position.top_left
+        "Top Right"    => position.top_right
+        "Bottom Left"  => position.bottom_left
+        "Bottom Right" => position.bottom_right
+        "Middle Left"  => position.middle_left
+        "Middle Right" => position.middle_right
+        => position.bottom_right
+
+// request.security() returns an na array id until the HTF series has data,
+// so check the id itself before touching any array method.
+f_at(array<float> a, int i) =>
+    float r = na
+    if not na(a)
+        if i >= 0 and i < a.size()
+            r := a.get(i)
+    r
+
+f_fmtVal(float v) =>
+    if na(v)
+        "—"
+    else
+        float a = math.abs(v)
+        string fmt = a >= 100 ? "#,##0.0" : a >= 1 ? "0.00" : a >= 0.01 ? "0.0000" : "0.000000"
+        str.tostring(v, fmt)
+
+f_histColor(float v, float vPrev) =>
+    bool rising = not na(vPrev) and v >= vPrev
+    v == 0 ? color.gray : v > 0 ? (rising ? HIST_POS_UP : HIST_POS_DOWN) : (rising ? HIST_NEG_UP : HIST_NEG_DOWN)
+
+f_map(float v, float lo, float span, float yBot, float yTop) =>
+    yBot + (v - lo) / span * (yTop - yBot)
+
+// HTF ladder: 5, 15, 30, 60, 240, 1D, 1W, 1M, 3M, 6M, 12M
+f_ladderTf(int i) =>
+    switch i
+        0 => "5"
+        1 => "15"
+        2 => "30"
+        3 => "60"
+        4 => "240"
+        5 => "1D"
+        6 => "1W"
+        7 => "1M"
+        8 => "3M"
+        9 => "6M"
+        => "12M"
+
+// first ladder entry strictly above the chart timeframe
+f_ladderStart() =>
+    int s = timeframe.in_seconds()
+    switch
+        na(s) or s < 300                => 0
+        s < 900                         => 1
+        s < 1800                        => 2
+        s < 3600                        => 3
+        s < 14400                       => 4
+        s < 86400                       => 5
+        s < timeframe.in_seconds("1W")  => 6
+        s < timeframe.in_seconds("1M")  => 7
+        s < timeframe.in_seconds("3M")  => 8
+        s < timeframe.in_seconds("6M")  => 9
+        => 10
+
+f_autoHtf(int step) =>
+    f_ladderTf(math.min(f_ladderStart() + step - 1, 10))
+
+// "60" -> "1H", "360" -> "6H", "45" -> "45m", "30S" -> "30s", D/W/M unchanged.
+// Flags a manual TF lower than the chart TF with "⚠".
+f_tfLabel(string tf) =>
+    int s = timeframe.in_seconds(tf)
+    string base = s < 60 ? str.tostring(s) + "s" : s < 86400 ? (s % 3600 == 0 ? str.tostring(int(s / 3600)) + "H" : str.tostring(int(s / 60)) + "m") : tf
+    s < timeframe.in_seconds() ? base + " ⚠" : base
+
+f_title(string lbl, int bias) =>
+    lbl + (bias > 0 ? "  ▲" : bias < 0 ? "  ▼" : "")
+
+// ───────────────────────────── HTF data collection ─────────────────────────────
+// Runs inside request.security(): rolling window of OHLC + MACD, newest at index 0.
+collectPanelData(int _keep) =>
+    var array<float> o_arr = array.new_float()
+    var array<float> h_arr = array.new_float()
+    var array<float> l_arr = array.new_float()
+    var array<float> c_arr = array.new_float()
+    var array<float> m_arr = array.new_float()
+    var array<float> s_arr = array.new_float()
+    var array<float> x_arr = array.new_float()
+    [m, s, x] = ta.macd(close, macd_fast, macd_slow, macd_signal)
+    o_arr.unshift(open)
+    h_arr.unshift(high)
+    l_arr.unshift(low)
+    c_arr.unshift(close)
+    m_arr.unshift(m)
+    s_arr.unshift(s)
+    x_arr.unshift(x)
+    if o_arr.size() > _keep
+        o_arr.pop()
+        h_arr.pop()
+        l_arr.pop()
+        c_arr.pop()
+        m_arr.pop()
+        s_arr.pop()
+        x_arr.pop()
+    [o_arr, h_arr, l_arr, c_arr, m_arr, s_arr, x_arr]
+
+// Cross / bias state from the newest usable bar (index _sk) vs the one before it.
+f_state(array<float> m, array<float> s, int sk) =>
+    float mc = f_at(m, sk)
+    float sc = f_at(s, sk)
+    float mp = f_at(m, sk + 1)
+    float sp = f_at(s, sk + 1)
+    bool valid = not na(mc) and not na(sc) and not na(mp) and not na(sp)
+    bool bullX = valid and mp - sp <= 0 and mc - sc > 0
+    bool bearX = valid and mp - sp >= 0 and mc - sc < 0
+    int bias = na(mc) or na(sc) ? 0 : mc > sc ? 1 : mc < sc ? -1 : 0
+    [bullX, bearX, bias]
+
+// ───────────────────────────── Panel renderer ─────────────────────────────
+// Redraws on every last-bar execution so the panel stays attached to the latest bar
+// and always reflects current values. Line count stays within budget because every
+// object from the previous draw is deleted first.
+renderPanel(bool _enable, array<float> _o, array<float> _hi, array<float> _lo, array<float> _c,
+     array<float> _m, array<float> _s, array<float> _x, string _title, float _yATR, int _xOff,
+     float _atr, float _heightATR, int _maxBars, int _w, int _skip) =>
+    var array<line>  lns   = array.new<line>()
+    var array<label> lbs   = array.new<label>()
+    var box          frame = na
+
+    if _enable and show_panels and barstate.islast and not na(_atr)
+        while lns.size() > 0
+            line.delete(lns.pop())
+        while lbs.size() > 0
+            label.delete(lbs.pop())
+        if not na(frame)
+            box.delete(frame)
+            frame := na
+
+        bool dataOk = not (na(_o) or na(_hi) or na(_lo) or na(_c) or na(_m) or na(_s) or na(_x))
+        int n = 0
+        if dataOk
+            n := math.min(_o.size() - _skip, _maxBars)
+        if n > 1
+            // only the usable window (excludes the developing bar in closed-bar mode)
+            array<float> oS = _o.slice(_skip, _skip + n)
+            array<float> hS = _hi.slice(_skip, _skip + n)
+            array<float> lS = _lo.slice(_skip, _skip + n)
+            array<float> cS = _c.slice(_skip, _skip + n)
+            array<float> mS = _m.slice(_skip, _skip + n)
+            array<float> sS = _s.slice(_skip, _skip + n)
+            array<float> xS = _x.slice(_skip, _skip + n)
+
+            // geometry
+            float H    = _heightATR * _atr
+            float yTop = close + _yATR * _atr + H / 2.0
+            float yBot = yTop - H
+            float cTop = yTop
+            float cBot = yTop - H * 0.40
+            float mTop = show_panel_candles ? cBot - H * 0.05 : yTop
+            float mBot = yBot
+
+            // price range
+            float pLo   = lS.min()
+            float pHi   = hS.max()
+            float pSpan = pHi - pLo == 0 ? 1.0 : pHi - pLo
+
+            // MACD range always includes zero, so histogram columns stay inside the band
+            float mLo = math.min(0.0, mS.min(), sS.min(), xS.min())
+            float mHi = math.max(0.0, mS.max(), sS.max(), xS.max())
+            mLo := na(mLo) ? -1.0 : mLo
+            mHi := na(mHi) ? 1.0 : mHi
+            float mSpan = mHi - mLo == 0 ? 1.0 : mHi - mLo
+
+            int   x0    = bar_index + _xOff
+            int   xEnd  = x0 + (n - 1) * _w
+            float yZero = f_map(0.0, mLo, mSpan, mBot, mTop)
+            int   hw    = _w >= 2 ? 3 : 2
+
+            if show_frame
+                frame := box.new(left=x0 - 1, top=yTop, right=xEnd + 1, bottom=yBot, border_color=panel_border_col, border_width=1, bgcolor=panel_bg_col, xloc=xloc.bar_index, force_overlay=true)
+
+            if show_zero_line
+                lns.push(line.new(x0, yZero, xEnd, yZero, xloc=xloc.bar_index, color=color.new(color.gray, 40), style=line.style_dotted, width=1, force_overlay=true))
+
+            for idx = 0 to n - 1
+                int j = n - 1 - idx          // arrays are newest-first; draw left-to-right
+                int x = x0 + idx * _w
+
+                if show_panel_candles
+                    float o = oS.get(j)
+                    float c = cS.get(j)
+                    color cc = color.new(o > c ? panel_bear_col : panel_bull_col, panel_candle_transp)
+                    lns.push(line.new(x, f_map(hS.get(j), pLo, pSpan, cBot, cTop), x, f_map(lS.get(j), pLo, pSpan, cBot, cTop), xloc=xloc.bar_index, color=cc, width=1, force_overlay=true))
+                    lns.push(line.new(x, f_map(o, pLo, pSpan, cBot, cTop), x, f_map(c, pLo, pSpan, cBot, cTop), xloc=xloc.bar_index, color=cc, width=3, force_overlay=true))
+
+                float v3 = xS.get(j)
+                if not na(v3)
+                    float v3p = f_at(_x, _skip + j + 1)
+                    lns.push(line.new(x, yZero, x, f_map(v3, mLo, mSpan, mBot, mTop), xloc=xloc.bar_index, color=f_histColor(v3, v3p), width=hw, force_overlay=true))
+
+                if idx < n - 1
+                    int   jn = j - 1
+                    int   xn = x + _w
+                    float a1 = mS.get(j)
+                    float b1 = mS.get(jn)
+                    float a2 = sS.get(j)
+                    float b2 = sS.get(jn)
+                    if not na(a1) and not na(b1)
+                        lns.push(line.new(x, f_map(a1, mLo, mSpan, mBot, mTop), xn, f_map(b1, mLo, mSpan, mBot, mTop), xloc=xloc.bar_index, color=MACD_LINE_COLOR, width=2, force_overlay=true))
+                    if not na(a2) and not na(b2)
+                        lns.push(line.new(x, f_map(a2, mLo, mSpan, mBot, mTop), xn, f_map(b2, mLo, mSpan, mBot, mTop), xloc=xloc.bar_index, color=MACD_SIGNAL_COLOR, width=1, force_overlay=true))
+                    if show_cross_marks and not na(a1) and not na(b1) and not na(a2) and not na(b2)
+                        float dPrev = a1 - a2
+                        float dCur  = b1 - b2
+                        if dPrev <= 0 and dCur > 0
+                            lbs.push(label.new(xn, f_map(b1, mLo, mSpan, mBot, mTop), "", xloc=xloc.bar_index, yloc=yloc.price, color=HIST_POS_UP, style=label.style_circle, size=size.tiny, force_overlay=true))
+                        else if dPrev >= 0 and dCur < 0
+                            lbs.push(label.new(xn, f_map(b1, mLo, mSpan, mBot, mTop), "", xloc=xloc.bar_index, yloc=yloc.price, color=HIST_NEG_DOWN, style=label.style_circle, size=size.tiny, force_overlay=true))
+
+            if show_panel_labels
+                lbs.push(label.new(x0 - 1 - panel_label_offset, (yTop + yBot) / 2.0, _title, xloc=xloc.bar_index, yloc=yloc.price, color=color.new(color.black, 100), style=label.style_label_right, textcolor=chart.fg_color, size=size.normal, force_overlay=true))
+
+// ───────────────────────────── Chart-timeframe MACD (indicator pane) ─────────────────────────────
+[curMacdLine, curMacdSignal, curMacdHist] = ta.macd(close, macd_fast, macd_slow, macd_signal)
+plot(curMacdHist, "Histogram", f_histColor(curMacdHist, curMacdHist[1]), style=plot.style_columns)
+plot(curMacdLine, "MACD", MACD_LINE_COLOR, 2)
+plot(curMacdSignal, "Signal", MACD_SIGNAL_COLOR, 1)
+hline(0, "Zero Line", color.new(color.gray, 50), hline.style_dashed)
+
+// ───────────────────────────── MACD Zone Lines (indicator pane) ─────────────────────────────
+const string G_ZONE = "MACD Zones"
+const string ZONE_STYLE_TIP = "Line style for this zone level."
+
+show_zones = input.bool(true, "Show Zone Lines", group=G_ZONE)
+
+z1_val   = input.float(20.0,  "Upper Extreme", inline="z1", group=G_ZONE)
+z1_col   = input.color(color.new(color.red, 20), "", inline="z1", group=G_ZONE)
+z1_style = input.string("Dashed", "", options=["Solid", "Dashed", "Dotted"], inline="z1", group=G_ZONE, tooltip=ZONE_STYLE_TIP)
+z1_width = input.int(1, "", minval=1, maxval=4, inline="z1", group=G_ZONE)
+
+z2_val   = input.float(5.0,   "Upper Neutral", inline="z2", group=G_ZONE)
+z2_col   = input.color(color.new(color.orange, 30), "", inline="z2", group=G_ZONE)
+z2_style = input.string("Dotted", "", options=["Solid", "Dashed", "Dotted"], inline="z2", group=G_ZONE, tooltip=ZONE_STYLE_TIP)
+z2_width = input.int(1, "", minval=1, maxval=4, inline="z2", group=G_ZONE)
+
+z3_val   = input.float(-5.0,  "Lower Neutral", inline="z3", group=G_ZONE)
+z3_col   = input.color(color.new(color.teal, 30), "", inline="z3", group=G_ZONE)
+z3_style = input.string("Dotted", "", options=["Solid", "Dashed", "Dotted"], inline="z3", group=G_ZONE, tooltip=ZONE_STYLE_TIP)
+z3_width = input.int(1, "", minval=1, maxval=4, inline="z3", group=G_ZONE)
+
+z4_val   = input.float(-20.0, "Lower Extreme", inline="z4", group=G_ZONE)
+z4_col   = input.color(color.new(color.green, 20), "", inline="z4", group=G_ZONE)
+z4_style = input.string("Dashed", "", options=["Solid", "Dashed", "Dotted"], inline="z4", group=G_ZONE, tooltip=ZONE_STYLE_TIP)
+z4_width = input.int(1, "", minval=1, maxval=4, inline="z4", group=G_ZONE)
+
+show_zone_fill = input.bool(true, "Shade Zones", group=G_ZONE, tooltip="Shades the bands between the zone lines: upper extreme band, neutral band (between the two neutral lines), lower extreme band.")
+fill_upper_col = input.color(color.new(color.red, 90),   "Upper Band (Neutral → Extreme)", group=G_ZONE)
+fill_mid_col   = input.color(color.new(color.gray, 94),  "Neutral Band", group=G_ZONE)
+fill_lower_col = input.color(color.new(color.green, 90), "Lower Band (Extreme → Neutral)", group=G_ZONE)
+
+// hline() needs an "input"-qualified style. switch/if can't return the const
+// hline.style_* values from a non-const condition (CE10139), but a ternary on the
+// input string can, so the style is picked inline with a ternary.
+z1_ls = z1_style == "Solid" ? hline.style_solid : z1_style == "Dotted" ? hline.style_dotted : hline.style_dashed
+z2_ls = z2_style == "Solid" ? hline.style_solid : z2_style == "Dotted" ? hline.style_dotted : hline.style_dashed
+z3_ls = z3_style == "Solid" ? hline.style_solid : z3_style == "Dotted" ? hline.style_dotted : hline.style_dashed
+z4_ls = z4_style == "Solid" ? hline.style_solid : z4_style == "Dotted" ? hline.style_dotted : hline.style_dashed
+
+hz1 = hline(z1_val, "Zone: Upper Extreme", show_zones ? z1_col : na, z1_ls, z1_width)
+hz2 = hline(z2_val, "Zone: Upper Neutral", show_zones ? z2_col : na, z2_ls, z2_width)
+hz3 = hline(z3_val, "Zone: Lower Neutral", show_zones ? z3_col : na, z3_ls, z3_width)
+hz4 = hline(z4_val, "Zone: Lower Extreme", show_zones ? z4_col : na, z4_ls, z4_width)
+
+fill(hz1, hz2, show_zones and show_zone_fill ? fill_upper_col : na, "Zone Fill: Upper")
+fill(hz2, hz3, show_zones and show_zone_fill ? fill_mid_col   : na, "Zone Fill: Neutral")
+fill(hz3, hz4, show_zones and show_zone_fill ? fill_lower_col : na, "Zone Fill: Lower")
+
+// ───────────────────────────── Timeframes ─────────────────────────────
+htf1_tf = htf1_auto ? f_autoHtf(1) : htf1_manual_tf
+htf2_tf = htf2_auto ? f_autoHtf(2) : htf2_manual_tf
+htf3_tf = htf3_auto ? f_autoHtf(3) : htf3_manual_tf
+htf4_tf = htf4_auto ? f_autoHtf(4) : htf4_manual_tf
+
+htf1_lbl = f_tfLabel(htf1_tf)
+htf2_lbl = f_tfLabel(htf2_tf)
+htf3_lbl = f_tfLabel(htf3_tf)
+htf4_lbl = f_tfLabel(htf4_tf)
+
+// In closed-bar mode lookahead_on is safe: index 0 (the bar that would leak future data
+// on history) is never read — everything uses index SKIP = 1 and older.
+[p1_o, p1_hi, p1_lo, p1_c, p1_m, p1_s, p1_x] = request.security(syminfo.tickerid, htf1_tf, collectPanelData(KEEP_BARS), lookahead=req_lookahead, calc_bars_count=panel_bars + 300)
+[p2_o, p2_hi, p2_lo, p2_c, p2_m, p2_s, p2_x] = request.security(syminfo.tickerid, htf2_tf, collectPanelData(KEEP_BARS), lookahead=req_lookahead, calc_bars_count=panel_bars + 300)
+[p3_o, p3_hi, p3_lo, p3_c, p3_m, p3_s, p3_x] = request.security(syminfo.tickerid, htf3_tf, collectPanelData(KEEP_BARS), lookahead=req_lookahead, calc_bars_count=panel_bars + 300)
+[p4_o, p4_hi, p4_lo, p4_c, p4_m, p4_s, p4_x] = request.security(syminfo.tickerid, htf4_tf, collectPanelData(KEEP_BARS), lookahead=req_lookahead, calc_bars_count=panel_bars + 300)
+
+// ───────────────────────────── Signal state / confluence ─────────────────────────────
+bool a2 = panel_count >= 2
+bool a3 = panel_count >= 3
+bool a4 = panel_count >= 4
+
+[bx1, sx1, b1] = f_state(p1_m, p1_s, SKIP)
+[bx2, sx2, b2] = f_state(p2_m, p2_s, SKIP)
+[bx3, sx3, b3] = f_state(p3_m, p3_s, SKIP)
+[bx4, sx4, b4] = f_state(p4_m, p4_s, SKIP)
+
+int bullCnt = (b1 > 0 ? 1 : 0) + (a2 and b2 > 0 ? 1 : 0) + (a3 and b3 > 0 ? 1 : 0) + (a4 and b4 > 0 ? 1 : 0)
+int bearCnt = (b1 < 0 ? 1 : 0) + (a2 and b2 < 0 ? 1 : 0) + (a3 and b3 < 0 ? 1 : 0) + (a4 and b4 < 0 ? 1 : 0)
+bool allBull = bullCnt == panel_count
+bool allBear = bearCnt == panel_count
+
+// ───────────────────────────── Layout / budgets ─────────────────────────────
+float panelATR = ta.atr(panel_atr_len)
+
+// 500-line cap: per panel = 1 zero line + per bar (hist + MACD + signal [+ 2 candle lines])
+int cost_per_bar = 3 + (show_panel_candles ? 2 : 0)
+int line_budget  = 490 - panel_count
+int render_bars  = math.max(2, math.min(panel_bars, int(line_budget / (panel_count * cost_per_bar))))
+
+// drawings may extend at most 500 bars past the last bar
+int max_w    = panel_count == 4 ? int((493 - panel_xoffset - panel_col_gap) / (2 * render_bars)) : int((493 - panel_xoffset) / render_bars)
+int candle_w = math.max(1, math.min(panel_candle_width, max_w))
+
+float stack_budget = 3.0 * panel_height + 2.0 * panel_gap
+float auto_panel_height = switch panel_count
+    1 => panel_height * 6.0
+    2 => (stack_budget - panel_gap) / 2.0
+    4 => (stack_budget - panel_gap) / 2.0
+    => panel_height
+float eff_height = panel_size_mode == "Manual" ? panel_height * panel_manual_scale : auto_panel_height
+
+float slot_spacing = (panel_count == 2 or panel_count == 4) ? (eff_height + panel_gap) / 2.0 : (eff_height + panel_gap)
+float y_top = panel_center_y + slot_spacing
+float y_mid = panel_center_y
+float y_bot = panel_center_y - slot_spacing
+
+int col1_x = panel_xoffset
+int col2_x = panel_xoffset + render_bars * candle_w + panel_col_gap
+
+// slot assignment
+float y1 = panel_count == 1 ? y_mid : y_top
+float y2 = panel_count == 3 ? y_mid : y_bot
+float y3 = panel_count == 3 ? y_bot : y_top
+float y4 = y_bot
+int   x3 = panel_count == 4 ? col2_x : col1_x
+
+renderPanel(true, p1_o, p1_hi, p1_lo, p1_c, p1_m, p1_s, p1_x, f_title(htf1_lbl, b1), y1, col1_x, panelATR, eff_height, render_bars, candle_w, SKIP)
+renderPanel(a2,   p2_o, p2_hi, p2_lo, p2_c, p2_m, p2_s, p2_x, f_title(htf2_lbl, b2), y2, col1_x, panelATR, eff_height, render_bars, candle_w, SKIP)
+renderPanel(a3,   p3_o, p3_hi, p3_lo, p3_c, p3_m, p3_s, p3_x, f_title(htf3_lbl, b3), y3, x3,     panelATR, eff_height, render_bars, candle_w, SKIP)
+renderPanel(a4,   p4_o, p4_hi, p4_lo, p4_c, p4_m, p4_s, p4_x, f_title(htf4_lbl, b4), y4, col2_x, panelATR, eff_height, render_bars, candle_w, SKIP)
+
+// ───────────────────────────── Signal table ─────────────────────────────
+f_row(table t, int r, string lbl, array<float> m, array<float> s, array<float> x, int sk, int bias, color bg) =>
+    float hv = f_at(x, sk)
+    table.cell(t, 0, r, lbl, text_color=color.silver, text_size=size.small, bgcolor=bg)
+    table.cell(t, 1, r, f_fmtVal(f_at(m, sk)), text_color=color.white, text_size=size.small, bgcolor=bg)
+    table.cell(t, 2, r, f_fmtVal(f_at(s, sk)), text_color=color.white, text_size=size.small, bgcolor=bg)
+    table.cell(t, 3, r, f_fmtVal(hv), text_color=na(hv) ? color.silver : f_histColor(hv, f_at(x, sk + 1)), text_size=size.small, bgcolor=bg)
+    table.cell(t, 4, r, bias > 0 ? "▲" : bias < 0 ? "▼" : "•", text_color=bias > 0 ? HIST_POS_UP : bias < 0 ? HIST_NEG_DOWN : color.gray, text_size=size.small, bgcolor=bg)
+
+var table sigTable = table.new(get_table_position(), 5, 6, bgcolor=color.new(color.navy, 20), border_width=1, force_overlay=true)
+
+if barstate.islast and show_signal_table
+    color hdr = color.navy
+    table.cell(sigTable, 0, 0, confirmed_only ? "HTF (closed)" : "HTF (live)", text_color=color.white, text_size=size.tiny, bgcolor=hdr)
+    table.cell(sigTable, 1, 0, "MACD", text_color=MACD_LINE_COLOR, text_size=size.tiny, bgcolor=hdr)
+    table.cell(sigTable, 2, 0, "Signal", text_color=MACD_SIGNAL_COLOR, text_size=size.tiny, bgcolor=hdr)
+    table.cell(sigTable, 3, 0, "Hist", text_color=color.silver, text_size=size.tiny, bgcolor=hdr)
+    table.cell(sigTable, 4, 0, "Bias", text_color=color.silver, text_size=size.tiny, bgcolor=hdr)
+
+    color bgA = color.new(color.navy, 60)
+    color bgB = color.new(color.navy, 80)
+    if show_panel_values_table
+        f_row(sigTable, 1, htf1_lbl, p1_m, p1_s, p1_x, SKIP, b1, bgA)
+        if a2
+            f_row(sigTable, 2, htf2_lbl, p2_m, p2_s, p2_x, SKIP, b2, bgB)
+        if a3
+            f_row(sigTable, 3, htf3_lbl, p3_m, p3_s, p3_x, SKIP, b3, bgA)
+        if a4
+            f_row(sigTable, 4, htf4_lbl, p4_m, p4_s, p4_x, SKIP, b4, bgB)
+
+    if show_confluence_row
+        int   r   = show_panel_values_table ? panel_count + 1 : 1
+        color cbg = allBull ? color.new(color.green, 55) : allBear ? color.new(color.red, 55) : bgA
+        string tot = "/" + str.tostring(panel_count)
+        table.cell(sigTable, 0, r, "Confluence", text_color=color.white, text_size=size.small, bgcolor=cbg)
+        table.cell(sigTable, 1, r, "▲ " + str.tostring(bullCnt) + tot, text_color=HIST_POS_UP, text_size=size.small, bgcolor=cbg)
+        table.cell(sigTable, 2, r, "▼ " + str.tostring(bearCnt) + tot, text_color=HIST_NEG_DOWN, text_size=size.small, bgcolor=cbg)
+        table.cell(sigTable, 3, r, "", bgcolor=cbg)
+        table.cell(sigTable, 4, r, allBull ? "ALL ▲" : allBear ? "ALL ▼" : "MIXED", text_color=color.white, text_size=size.small, bgcolor=cbg)
+
+// ───────────────────────────── Alerts ─────────────────────────────
+// Rising edges: in closed-bar mode these fire once, on the first chart bar after the HTF bar closes.
+bool bullEvt1 = bx1 and not bx1[1]
+bool bearEvt1 = sx1 and not sx1[1]
+bool bullEvt2 = a2 and bx2 and not bx2[1]
+bool bearEvt2 = a2 and sx2 and not sx2[1]
+bool bullEvt3 = a3 and bx3 and not bx3[1]
+bool bearEvt3 = a3 and sx3 and not sx3[1]
+bool bullEvt4 = a4 and bx4 and not bx4[1]
+bool bearEvt4 = a4 and sx4 and not sx4[1]
+
+bool anyBullEvt     = bullEvt1 or bullEvt2 or bullEvt3 or bullEvt4
+bool anyBearEvt     = bearEvt1 or bearEvt2 or bearEvt3 or bearEvt4
+bool allBullOnEvt   = allBull and not allBull[1]
+bool allBearOnEvt   = allBear and not allBear[1]
+
+alertcondition(anyBullEvt,   "HTF MACD Bullish Cross (any)",  "{{ticker}}: MACD crossed above Signal on an HTF panel")
+alertcondition(anyBearEvt,   "HTF MACD Bearish Cross (any)",  "{{ticker}}: MACD crossed below Signal on an HTF panel")
+alertcondition(allBullOnEvt, "HTF Full Bullish Confluence",   "{{ticker}}: all active HTFs have MACD above Signal")
+alertcondition(allBearOnEvt, "HTF Full Bearish Confluence",   "{{ticker}}: all active HTFs have MACD below Signal")
+
+f_alert(bool bullEvt, bool bearEvt, string lbl) =>
+    if fire_alerts
+        if bullEvt
+            alert(syminfo.ticker + " | " + lbl + " MACD bullish cross" + (confirmed_only ? " (closed bar)" : " (live bar)"), alert.freq_once_per_bar)
+        if bearEvt
+            alert(syminfo.ticker + " | " + lbl + " MACD bearish cross" + (confirmed_only ? " (closed bar)" : " (live bar)"), alert.freq_once_per_bar)
+
+f_alert(bullEvt1, bearEvt1, htf1_lbl)
+f_alert(bullEvt2, bearEvt2, htf2_lbl)
+f_alert(bullEvt3, bearEvt3, htf3_lbl)
+f_alert(bullEvt4, bearEvt4, htf4_lbl)
+if fire_alerts and allBullOnEvt
+    alert(syminfo.ticker + " | Full bullish HTF MACD confluence (" + str.tostring(panel_count) + "/" + str.tostring(panel_count) + ")", alert.freq_once_per_bar)
+if fire_alerts and allBearOnEvt
+    alert(syminfo.ticker + " | Full bearish HTF MACD confluence (" + str.tostring(panel_count) + "/" + str.tostring(panel_count) + ")", alert.freq_once_per_bar)
