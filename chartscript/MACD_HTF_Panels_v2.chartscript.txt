@@ -16,10 +16,13 @@
 //     that HTF bar has not closed before the current chart bar opened, so nothing reads the future.
 //   - Zone levels are plots (hline levels are documented as const), so line style and width for
 //     each zone are set from the Style tab instead of from inputs.
-//   - Every frame redraw first deletes all of this script's lines, labels and boxes, so the
-//     panels never pile up on live ticks regardless of how drawings are rolled back.
+//   - Performance: panels and table are redrawn only when their content changes (closed-HTF
+//     mode), panel geometry is anchored to the last confirmed bar so it is stable within a bar,
+//     MACD/Signal are polylines instead of per-bar segments, and HTF slots that are not shown
+//     request the chart timeframe instead of fetching another HTF. Each redraw first deletes all
+//     of this script's drawings, so nothing piles up however live ticks are rolled back.
 
-indicator("MACD with HTF Panels v2", shorttitle="MACD HTF v2", overlay=false, max_lines_count=500, max_labels_count=300, max_boxes_count=50)
+indicator("MACD with HTF Panels v2", shorttitle="MACD HTF v2", overlay=false, max_lines_count=500, max_labels_count=170, max_boxes_count=8, max_polylines_count=100)
 
 // ───────────────────────────── Constants ─────────────────────────────
 G_MACD  = "MACD"
@@ -127,6 +130,7 @@ color TREND_DOWN        = trend_down_col
 f_macdColor(float m, float sg) =>
     color_macd_by_trend and not na(m) and not na(sg) ? (m >= sg ? TREND_UP : TREND_DOWN) : MACD_LINE_COLOR
 
+int MAX_MACD_RUNS = 18          // colour runs per panel MACD polyline (4 panels x 19 + 4 signal < 100 polylines)
 int KEEP_BARS = panel_bars + 2    // skip slot + panel bars + one extra for prev-value colouring
 
 // ───────────────────────────── Helpers ─────────────────────────────
@@ -261,6 +265,11 @@ f_skip(array<int> at, array<int> atc, string tf) =>
         sk := endT > time ? 1 : 0
     sk
 
+// Identity of the newest usable HTF bar; changes only when the usable data changes.
+f_headKey(array<int> at, int sk) =>
+    int t = sk < array.size(at) ? array.get(at, sk) : 0
+    str.tostring(sk) + ":" + str.tostring(t)
+
 // Cross / bias state from the newest usable bar (index sk) vs the one before it.
 f_state(array<float> am, array<float> asg, int sk) =>
     float mc = f_at(am, sk)
@@ -275,7 +284,7 @@ f_state(array<float> am, array<float> asg, int sk) =>
 
 // ───────────────────────────── Panel renderer ─────────────────────────────
 // Draws one HTF panel. Called only on the last bar, after all previous drawings were deleted.
-renderPanel(array<float> ao, array<float> ah, array<float> al, array<float> ac, array<float> am, array<float> asg, array<float> ax, int sk, string title, float yC, int xOff, float unit, float hUnits, int maxBars, int w, bool titleRight) =>
+renderPanel(array<float> ao, array<float> ah, array<float> al, array<float> ac, array<float> am, array<float> asg, array<float> ax, int sk, string title, float yC, int xOff, float unit, float hUnits, int maxBars, int w, bool titleRight, int anchorBar, float baseY) =>
     int n = math.min(array.size(ao) - sk, maxBars)
     if n > 1
         // only the usable window (excludes the developing bar in closed-bar mode)
@@ -287,9 +296,9 @@ renderPanel(array<float> ao, array<float> ah, array<float> al, array<float> ac, 
         array<float> sS = array.slice(asg, sk, sk + n)
         array<float> xS = array.slice(ax, sk, sk + n)
 
-        // geometry (price units: centred yC ATRs above/below the last close)
+        // geometry (price units: centred yC ATRs above/below the anchor bar's close)
         float H    = hUnits * unit
-        float yTop = close + yC * unit + H / 2.0
+        float yTop = baseY + yC * unit + H / 2.0
         float yBot = yTop - H
         float cTop = yTop
         float cBot = yTop - H * 0.40
@@ -306,7 +315,7 @@ renderPanel(array<float> ao, array<float> ah, array<float> al, array<float> ac, 
         float mHi   = math.max(0.0, nz(array.max(mS)), nz(array.max(sS)), nz(array.max(xS)))
         float mSpan = mHi - mLo == 0 ? 1.0 : mHi - mLo
 
-        int   x0    = bar_index + xOff
+        int   x0    = anchorBar + xOff
         int   xEnd  = x0 + (n - 1) * w
         float yZero = f_map(0.0, mLo, mSpan, mBot, mTop)
         int   hw    = w >= 2 ? 3 : 2
@@ -316,6 +325,11 @@ renderPanel(array<float> ao, array<float> ah, array<float> al, array<float> ac, 
 
         if show_zero_line
             line.new(x0, yZero, xEnd, yZero, color=color.new(color.gray, 40), style=line.style_dotted, width=1, force_overlay=true)
+
+        sigPts = array.new<chart.point>()
+        macPts = array.new<chart.point>()
+        color runCol = MACD_LINE_COLOR
+        int   runs   = 0
 
         for idx = 0 to n - 1
             int j = n - 1 - idx          // arrays are newest-first; draw left-to-right
@@ -336,6 +350,37 @@ renderPanel(array<float> ao, array<float> ah, array<float> al, array<float> ac, 
                 float v3p = f_at(ax, sk + j + 1)
                 line.new(x, yZero, x, f_map(v3, mLo, mSpan, mBot, mTop), color=f_histColor(v3, v3p), width=hw, force_overlay=true)
 
+            // MACD / Signal points (drawn as polylines below)
+            float mv = array.get(mS, j)
+            float sv = array.get(sS, j)
+            if not na(sv)
+                array.push(sigPts, chart.point.from_index(x, f_map(sv, mLo, mSpan, mBot, mTop)))
+            if na(mv)
+                if array.size(macPts) >= 2
+                    polyline.new(macPts, curved=false, closed=false, line_color=runCol, line_width=2, force_overlay=true)
+                    runs := runs + 1
+                macPts := array.new<chart.point>()
+            else
+                pt = chart.point.from_index(x, f_map(mv, mLo, mSpan, mBot, mTop))
+                color segCol = f_macdColor(mv, sv)      // colour of the segment that ends at this point
+                int   np     = array.size(macPts)
+                if np == 0
+                    array.push(macPts, pt)
+                    runCol := segCol
+                else if np == 1 or segCol == runCol or runs >= MAX_MACD_RUNS
+                    if np == 1
+                        runCol := segCol
+                    array.push(macPts, pt)
+                else
+                    // trend colour changed: close the current run and start a new one from its last point
+                    lastPt = array.last(macPts)
+                    polyline.new(macPts, curved=false, closed=false, line_color=runCol, line_width=2, force_overlay=true)
+                    runs := runs + 1
+                    macPts := array.new<chart.point>()
+                    array.push(macPts, lastPt)
+                    array.push(macPts, pt)
+                    runCol := segCol
+
             if idx < n - 1
                 int   jn = j - 1
                 int   xn = x + w
@@ -343,10 +388,6 @@ renderPanel(array<float> ao, array<float> ah, array<float> al, array<float> ac, 
                 float mB = array.get(mS, jn)
                 float sA = array.get(sS, j)
                 float sB = array.get(sS, jn)
-                if not na(mA) and not na(mB)
-                    line.new(x, f_map(mA, mLo, mSpan, mBot, mTop), xn, f_map(mB, mLo, mSpan, mBot, mTop), color=f_macdColor(mB, sB), width=2, force_overlay=true)
-                if not na(sA) and not na(sB)
-                    line.new(x, f_map(sA, mLo, mSpan, mBot, mTop), xn, f_map(sB, mLo, mSpan, mBot, mTop), color=MACD_SIGNAL_COLOR, width=1, force_overlay=true)
                 if show_cross_marks and show_cross_dots and not na(mA) and not na(mB) and not na(sA) and not na(sB)
                     float dPrev = mA - sA
                     float dCur  = mB - sB
@@ -354,6 +395,11 @@ renderPanel(array<float> ao, array<float> ah, array<float> al, array<float> ac, 
                         label.new(xn, f_map(mB, mLo, mSpan, mBot, mTop), "", color=TREND_UP, style=label.style_circle, size=size.tiny, force_overlay=true)
                     else if dPrev >= 0 and dCur < 0
                         label.new(xn, f_map(mB, mLo, mSpan, mBot, mTop), "", color=TREND_DOWN, style=label.style_circle, size=size.tiny, force_overlay=true)
+
+        if array.size(macPts) >= 2
+            polyline.new(macPts, curved=false, closed=false, line_color=runCol, line_width=2, force_overlay=true)
+        if array.size(sigPts) >= 2
+            polyline.new(sigPts, curved=false, closed=false, line_color=MACD_SIGNAL_COLOR, line_width=1, force_overlay=true)
 
         if show_panel_labels
             // right-column titles sit to the right of their panel so they never cover the left column
@@ -388,18 +434,27 @@ htf2_tf = htf2_auto ? f_autoHtf(2) : htf2_manual_tf
 htf3_tf = htf3_auto ? f_autoHtf(3) : htf3_manual_tf
 htf4_tf = htf4_auto ? f_autoHtf(4) : htf4_manual_tf
 
-htf1_lbl = f_tfLabel(htf1_tf)
-htf2_lbl = f_tfLabel(htf2_tf)
-htf3_lbl = f_tfLabel(htf3_tf)
-htf4_lbl = f_tfLabel(htf4_tf)
+var string htf1_lbl = f_tfLabel(htf1_tf)
+var string htf2_lbl = f_tfLabel(htf2_tf)
+var string htf3_lbl = f_tfLabel(htf3_tf)
+var string htf4_lbl = f_tfLabel(htf4_tf)
 
 // ───────────────────────────── HTF data collection ─────────────────────────────
 // lookahead_off: on history the HTF value appears once its HTF bar is confirmed; on the live
 // bar it is the forming HTF bar. f_skip() removes the forming bar in closed-bar mode.
+bool a2 = panel_count >= 2
+bool a3 = panel_count >= 3
+bool a4 = panel_count >= 4
+
+// Slots that are not shown request the chart's own timeframe, so no extra HTF series is fetched.
+req2_tf = a2 ? htf2_tf : timeframe.period
+req3_tf = a3 ? htf3_tf : timeframe.period
+req4_tf = a4 ? htf4_tf : timeframe.period
+
 [q1t, q1tc, q1o, q1h, q1l, q1c, q1m, q1s, q1x] = request.security(syminfo.tickerid, htf1_tf, htfData(), lookahead=barmerge.lookahead_off)
-[q2t, q2tc, q2o, q2h, q2l, q2c, q2m, q2s, q2x] = request.security(syminfo.tickerid, htf2_tf, htfData(), lookahead=barmerge.lookahead_off)
-[q3t, q3tc, q3o, q3h, q3l, q3c, q3m, q3s, q3x] = request.security(syminfo.tickerid, htf3_tf, htfData(), lookahead=barmerge.lookahead_off)
-[q4t, q4tc, q4o, q4h, q4l, q4c, q4m, q4s, q4x] = request.security(syminfo.tickerid, htf4_tf, htfData(), lookahead=barmerge.lookahead_off)
+[q2t, q2tc, q2o, q2h, q2l, q2c, q2m, q2s, q2x] = request.security(syminfo.tickerid, req2_tf, htfData(), lookahead=barmerge.lookahead_off)
+[q3t, q3tc, q3o, q3h, q3l, q3c, q3m, q3s, q3x] = request.security(syminfo.tickerid, req3_tf, htfData(), lookahead=barmerge.lookahead_off)
+[q4t, q4tc, q4o, q4h, q4l, q4c, q4m, q4s, q4x] = request.security(syminfo.tickerid, req4_tf, htfData(), lookahead=barmerge.lookahead_off)
 
 var array<int>   b1t  = array.new<int>()
 var array<int>   b1tc = array.new<int>()
@@ -447,14 +502,11 @@ _n3 = f_feed(b3t, b3tc, b3o, b3h, b3l, b3c, b3m, b3s, b3x, q3t, q3tc, q3o, q3h, 
 _n4 = f_feed(b4t, b4tc, b4o, b4h, b4l, b4c, b4m, b4s, b4x, q4t, q4tc, q4o, q4h, q4l, q4c, q4m, q4s, q4x, KEEP_BARS)
 
 sk1 = f_skip(b1t, b1tc, htf1_tf)
-sk2 = f_skip(b2t, b2tc, htf2_tf)
-sk3 = f_skip(b3t, b3tc, htf3_tf)
-sk4 = f_skip(b4t, b4tc, htf4_tf)
+sk2 = f_skip(b2t, b2tc, req2_tf)
+sk3 = f_skip(b3t, b3tc, req3_tf)
+sk4 = f_skip(b4t, b4tc, req4_tf)
 
 // ───────────────────────────── Signal state / confluence ─────────────────────────────
-bool a2 = panel_count >= 2
-bool a3 = panel_count >= 3
-bool a4 = panel_count >= 4
 
 [bx1, sx1, b1] = f_state(b1m, b1s, sk1)
 [bx2, sx2, b2] = f_state(b2m, b2s, sk2)
@@ -470,8 +522,8 @@ bool allBear = bearCnt == panel_count
 // 1 size unit = peak |MACD|, |Signal| or |Hist| of the chart timeframe over the lookback.
 float panelUnit = ta.atr(panel_unit_len)
 
-// 500-line cap: per panel = 1 zero line + per bar (hist + MACD + signal [+ 2 candle lines])
-int cost_per_bar = 3 + (show_panel_candles ? 2 : 0)
+// 500-line cap: per panel = 1 zero line + per bar (hist [+ 2 candle lines]); MACD/Signal are polylines
+int cost_per_bar = 1 + (show_panel_candles ? 2 : 0)
 int line_budget  = 490 - panel_count
 int render_bars  = math.max(2, math.min(panel_bars, math.floor(line_budget / (panel_count * cost_per_bar))))
 
@@ -503,8 +555,28 @@ float y3 = panel_count == 3 ? y_bot : y_top
 float y4 = y_bot
 int   x3 = panel_count == 4 ? col2_x : col1_x
 
-if barstate.islast
-    // Remove everything drawn by the previous run (last tick), then redraw.
+// ───────────────────────────── Redraw gating ─────────────────────────────
+// Geometry is anchored to the last confirmed bar, so within a live bar the panels do not move.
+// In closed-HTF mode the content only changes when a new HTF bar becomes usable or the anchor
+// bar advances, so panels and table are rebuilt only then. lastKey is a plain var: it rolls back
+// with each live tick, so a change since the last confirmed bar is redrawn on every tick of that
+// bar (safe whether or not drawings roll back) and nothing is redrawn otherwise.
+float prevClose = close[1]
+float prevUnit  = panelUnit[1]
+bool  anchorNow   = barstate.isconfirmed
+int   anchorBar   = anchorNow ? bar_index : bar_index - 1
+float anchorClose = anchorNow ? close : prevClose
+float anchorUnit  = anchorNow ? panelUnit : prevUnit
+
+var string lastKey = ""
+string drawKey  = barstate.islast ? str.tostring(anchorBar) + "|" + f_headKey(b1t, sk1) + "|" + f_headKey(b2t, sk2) + "|" + f_headKey(b3t, sk3) + "|" + f_headKey(b4t, sk4) : ""
+bool   doRedraw = barstate.islast and (not confirmed_only or drawKey != lastKey)
+
+if doRedraw
+    // Remove everything drawn by the previous redraw, then redraw.
+    array<polyline> oldPolys = array.copy(polyline.all)
+    for pl in oldPolys
+        polyline.delete(pl)
     array<line> oldLines = array.copy(line.all)
     for ln in oldLines
         line.delete(ln)
@@ -515,14 +587,14 @@ if barstate.islast
     for bx in oldBoxes
         box.delete(bx)
 
-    if show_panels and not na(panelUnit) and panelUnit > 0
-        _r1 = renderPanel(b1o, b1h, b1l, b1c, b1m, b1s, b1x, sk1, f_title(htf1_lbl, b1), y1, col1_x, panelUnit, eff_height, render_bars, candle_w, false)
+    if show_panels and not na(anchorUnit) and anchorUnit > 0
+        _r1 = renderPanel(b1o, b1h, b1l, b1c, b1m, b1s, b1x, sk1, f_title(htf1_lbl, b1), y1, col1_x, anchorUnit, eff_height, render_bars, candle_w, false, anchorBar, anchorClose)
         if a2
-            _r2 = renderPanel(b2o, b2h, b2l, b2c, b2m, b2s, b2x, sk2, f_title(htf2_lbl, b2), y2, col1_x, panelUnit, eff_height, render_bars, candle_w, false)
+            _r2 = renderPanel(b2o, b2h, b2l, b2c, b2m, b2s, b2x, sk2, f_title(htf2_lbl, b2), y2, col1_x, anchorUnit, eff_height, render_bars, candle_w, false, anchorBar, anchorClose)
         if a3
-            _r3 = renderPanel(b3o, b3h, b3l, b3c, b3m, b3s, b3x, sk3, f_title(htf3_lbl, b3), y3, x3, panelUnit, eff_height, render_bars, candle_w, panel_count == 4 and not pine_layout)
+            _r3 = renderPanel(b3o, b3h, b3l, b3c, b3m, b3s, b3x, sk3, f_title(htf3_lbl, b3), y3, x3, anchorUnit, eff_height, render_bars, candle_w, panel_count == 4 and not pine_layout, anchorBar, anchorClose)
         if a4
-            _r4 = renderPanel(b4o, b4h, b4l, b4c, b4m, b4s, b4x, sk4, f_title(htf4_lbl, b4), y4, col2_x, panelUnit, eff_height, render_bars, candle_w, not pine_layout)
+            _r4 = renderPanel(b4o, b4h, b4l, b4c, b4m, b4s, b4x, sk4, f_title(htf4_lbl, b4), y4, col2_x, anchorUnit, eff_height, render_bars, candle_w, not pine_layout, anchorBar, anchorClose)
 
 // ───────────────────────────── Signal table ─────────────────────────────
 f_row(table t, int r, string lbl, array<float> am, array<float> asg, array<float> ax, int sk, int bias, color bg) =>
@@ -536,7 +608,7 @@ f_row(table t, int r, string lbl, array<float> am, array<float> asg, array<float
 
 var table sigTable = table.new(get_table_position(), 5, 6, bgcolor=color.new(color.navy, 20), border_width=1, force_overlay=true)
 
-if barstate.islast and show_signal_table
+if doRedraw and show_signal_table
     color hdr = color.navy
     table.cell(sigTable, 0, 0, confirmed_only ? "HTF (closed)" : "HTF (live)", text_color=color.white, text_size=size.tiny, bgcolor=hdr)
     table.cell(sigTable, 1, 0, "MACD", text_color=TREND_UP, text_size=size.tiny, bgcolor=hdr)
@@ -564,6 +636,9 @@ if barstate.islast and show_signal_table
         table.cell(sigTable, 2, r, "▼ " + str.tostring(bearCnt) + tot, text_color=HIST_NEG_DOWN, text_size=size.small, bgcolor=cbg)
         table.cell(sigTable, 3, r, "", bgcolor=cbg)
         table.cell(sigTable, 4, r, allBull ? "ALL ▲" : allBear ? "ALL ▼" : "MIXED", text_color=color.white, text_size=size.small, bgcolor=cbg)
+
+if doRedraw
+    lastKey := drawKey
 
 // ───────────────────────────── Alerts ─────────────────────────────
 // Rising edges: in closed-bar mode these fire once, on the first chart bar after the HTF bar closes.
